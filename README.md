@@ -152,12 +152,33 @@ END;
 /
 ```
 
-Multiple tools at once — see [`test_tool_builder.sql`](test_tool_builder.sql) for a full working example:
+Multiple tools at once — see [`test_multi_tool.sql`](tests/test_multi_tool.sql) for a full working example:
 
 ```sql
 l_tools := ai_tool_builder.build_tools(
   apex_t_varchar2('MY_PKG.CONVERT_CURRENCY', 'MY_PKG.GET_HEADCOUNT') );
 ```
+
+## Registry lifetime: build tools in the same request
+
+`build_tool`/`build_tools` record each tool in a package variable (`g_registry`), and `generic_response_handler` reads it when the model asks for a tool. Package variables live as long as the **database session's package state** does, so:
+
+- **Do:** call `build_tool`/`build_tools` in the same request, ideally the same PL/SQL block, as the `apex_ai.generate`/`chat` call. The handler runs synchronously inside that call, in the same session, so it sees the registry.
+- **Don't:** build tools in one request (for example a page-load process) and call `generate`/`chat` in another (an AJAX callback, a background job, a workflow). Package state may not be there, and the model is told `Error: no function registered for tool "..."`.
+- **When in doubt, rebuild on every request.** Building only reads `ALL_ARGUMENTS` and `ALL_SOURCE`.
+
+```sql
+-- Safe per-request pattern: build and call together, every time.
+l_tools := ai_tool_builder.build_tools(apex_t_varchar2('MY_PKG.CONVERT_CURRENCY'));
+l_response := apex_ai.generate(
+  p_prompt                     => :P1_QUESTION,
+  p_service_static_id          => 'MY_AI_SERVICE',
+  p_tools                      => l_tools,
+  p_response_handler_procedure => 'AI_TOOL_BUILDER.GENERIC_RESPONSE_HANDLER',
+  p_max_tool_roundtrips        => 5 );
+```
+
+If a tool call arrives for a name that isn't registered, the handler writes a warning to the APEX debug log (`ai_tool_builder: no function registered for tool ...`). Enable debug and look for it.
 
 ## API
 
@@ -174,9 +195,13 @@ l_tools := ai_tool_builder.build_tools(
 
 | File | Purpose |
 |---|---|
-| [`AI_TOOL_BUILDER.pks`](AI_TOOL_BUILDER.pks) | Package spec — public API |
-| [`AI_TOOL_BUILDER.pkb`](AI_TOOL_BUILDER.pkb) | Package body — implementation |
-| [`test_tool_builder.sql`](test_tool_builder.sql) | Runnable example: one tool, then two tools |
+| [`src/AI_TOOL_BUILDER.pks`](src/AI_TOOL_BUILDER.pks) | Package spec — public API |
+| [`src/AI_TOOL_BUILDER.pkb`](src/AI_TOOL_BUILDER.pkb) | Package body — implementation |
+| [`tests/setup_demo_tools.sql`](tests/setup_demo_tools.sql) | Creates `demo_tools_pkg`, the example tools (including an overloaded function and its wrappers) the other scripts use. Run first |
+| [`tests/test_single_tool.sql`](tests/test_single_tool.sql) | Runnable example: one tool (sanity check without an LLM, then a real agent run) |
+| [`tests/test_multi_tool.sql`](tests/test_multi_tool.sql) | Runnable example: two tools via `build_tools` (sanity check without an LLM, then a real agent run) |
+| [`tests/test_overloads.sql`](tests/test_overloads.sql) | Checks that an overloaded function raises `ORA-20703` and that per-overload wrapper functions work (no LLM needed) |
+| [`tests/test_dates.sql`](tests/test_dates.sql) | Runnable example: `DATE`, `TIMESTAMP` and `TIMESTAMP WITH TIME ZONE` parameters (sanity check without an LLM, then a real agent run) |
 
 ## Prerequisites
 
@@ -184,16 +209,64 @@ l_tools := ai_tool_builder.build_tools(
 - **A real, logged-in APEX session** before calling `apex_ai.generate`/`chat` with tools: `apex_session.create_session(p_app_id, p_page_id, p_username)`. `apex_util.set_workspace` alone is not enough once tools are involved — `apex_ai` validates the caller and will raise `Could not validate caller for user ""` without a real session.
 - Any existing app ID and username in your workspace (only used to establish the session).
 
+## Installation
+
+Compile the package into the schema that your APEX workspace is mapped to (the schema that will run the agent). The spec must be compiled before the body.
+
+```sql
+-- SQLcl / SQL*Plus, from the repository root
+@src/AI_TOOL_BUILDER.pks
+@src/AI_TOOL_BUILDER.pkb
+```
+
+In APEX, you can instead paste each file into **SQL Workshop > SQL Commands** and run it, spec first.
+
+Check that it compiled:
+
+```sql
+SELECT object_type, status FROM user_objects WHERE object_name = 'AI_TOOL_BUILDER';
+-- expect PACKAGE and PACKAGE BODY, both VALID
+```
+
+If either shows `INVALID` or the compile reports errors, the most likely cause is APEX older than 26.1 (the `apex_ai` tool types don't exist). See [Prerequisites](#prerequisites).
+
+To confirm it works without calling an LLM, run [`tests/setup_demo_tools.sql`](tests/setup_demo_tools.sql) and then [`tests/test_overloads.sql`](tests/test_overloads.sql), or the first block of [`tests/test_single_tool.sql`](tests/test_single_tool.sql). To remove it: `DROP PACKAGE ai_tool_builder;`.
+
 ## What it can and can't do
 
-- **Functions only**, not procedures — packaged or standalone both work.
-- **`IN` parameters only**, and only `NUMBER`-like, `VARCHAR2`/`CHAR`, or `CLOB` types. `BOOLEAN` parameters make `build_tool` fail fast (`ORA-20701`) — use `'Y'`/`'N'` VARCHAR2 instead.
-- **Every parameter is described to the model as text**, even numeric ones — this sidesteps a reproducible `ORA-20960` failure seen when a numeric-typed parameter was sent back by at least one model (`meta.llama-3.3-70b-instruct` on OCI). The function still receives a correctly-converted number; only the model-facing schema is text.
+- **Functions only**, not procedures — packaged or standalone both work. `build_tool` raises `ORA-20702` if the name isn't found, isn't visible to the calling schema, or isn't a function, so a typo fails at build time instead of during a tool call.
+- **`IN` parameters only**, and only `NUMBER`-like, `VARCHAR2`/`CHAR`, `CLOB`, `BOOLEAN`, `DATE` or `TIMESTAMP` types. A `BOOLEAN` is sent to the model as a boolean and passed to the function as a real `BOOLEAN` on every Oracle version (the handler binds `'Y'`/`'N'` and converts it in the generated call, because `DBMS_SQL` can't bind a `BOOLEAN` before 23ai).
+- **`DATE`, `TIMESTAMP` and `TIMESTAMP WITH [LOCAL] TIME ZONE` parameters are supported.** They are sent to the model as text, with an ISO 8601 example appended to the parameter description. The handler accepts `YYYY-MM-DD`, optionally followed by a time (`HH24:MI[:SS[.FF]]`) after a space or `T`, and optionally a UTC offset (`+05:30` or `Z`). It converts the text with explicit format masks, so `NLS_DATE_FORMAT` and other NLS settings have no effect. A time-zone parameter with no offset uses the session time zone; a `DATE` or `TIMESTAMP` takes the time as written and ignores any offset. Anything else (`14 March 2027`, `03/14/2027`, `2027-02-30`) raises `ORA-20704`, whose message tells the model to send an ISO 8601 value, so it can retry.
+- **Numeric parameters are sent to the model as numbers** and bound as `NUMBER`. If a model returns a number as a string, it is bound as text and Oracle converts it on the call.
 - **Tool results are capped at 32,767 characters** (a `VARCHAR2` limit in the dispatch code).
-- **Overloaded functions aren't disambiguated** — whichever the data dictionary returns first is used.
+- **Overloaded functions are rejected** — `build_tool` raises `ORA-20703` if the function name has more than one overload. Wrap each overload in a function with its own unique name and `@tool`/`@param` comments, and register the wrappers. See [`tests/test_overloads.sql`](tests/test_overloads.sql).
 - **Asking a model to call two tools in one sentence can be unreliable** — this is model behavior, not something this package causes. Sequential requests ("call A, then call B") work fine.
 
 `generic_response_handler` never raises: a failed dispatch or unknown tool name is returned to the model as `Error ...` text instead of crashing the request.
+
+## How the call is built (and why it is safe from injection)
+
+The handler runs the function with a small dynamic PL/SQL block. Two kinds of values go into it:
+
+- **Identifiers** (the function name and parameter names): taken from the name *you* pass to `build_tool` and from `ALL_ARGUMENTS`, never from the model. Each part is validated and quoted with `DBMS_ASSERT.ENQUOTE_NAME` when the tool is registered, and the function is confirmed to exist. The model can only choose among tools you registered.
+- **Argument values**: always bound with `DBMS_SQL.BIND_VARIABLE`, never concatenated into the SQL text.
+
+Names are used exactly as Oracle stores them, so lowercase quoted identifiers (`"myFunc"`) are not supported.
+
+## What the model sees when a tool fails
+
+The model never sees raw `SQLERRM`, because Oracle error text can contain schema, package, table and column names. The handler logs the full detail with `apex_debug.error` (message, function name and error backtrace) and returns a sanitized message:
+
+| Failure | What the model receives |
+|---|---|
+| Your function raises `RAISE_APPLICATION_ERROR(-20000..-20999, ...)` | `Error from tool "name": <your message>` (first line, max 500 chars) |
+| Argument rejected on conversion (`ORA-06502`, `ORA-01722`, `ORA-01858`, `ORA-01861`) | `Error: tool "name" rejected an argument value (wrong format or too long). Check the argument values and try again.` |
+| Any other error | `Error: tool "name" failed. Do not retry with the same arguments.` |
+| Unregistered tool name | `Error: no function registered for tool "name"` |
+
+Because `-20xxx` messages are passed through on purpose (they are how a tool tells the model "customer not found" or "amount must be positive"), write them as if the model, and therefore the end user, will read them: no table names, no internal IDs. To see the real error, enable APEX debug and search for `ai_tool_builder:`.
+
+The default tool description (used when a function has no `@tool` comment) is `Runs the "<tool name>" tool.` and does not include the owner, package or function name.
 
 ## Contributing
 

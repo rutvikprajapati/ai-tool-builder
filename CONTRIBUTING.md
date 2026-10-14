@@ -6,8 +6,8 @@ Issues and PRs are welcome.
 
 There's no CI for this repo — testing `ai_tool_builder` requires a live Oracle database with **APEX 26.1+** and a Generative AI Service configured as a shared component, so it can't be automated in a hosted runner. Don't expect a green checkmark on your PR; instead:
 
-1. Compile [`AI_TOOL_BUILDER.pks`](AI_TOOL_BUILDER.pks) and [`AI_TOOL_BUILDER.pkb`](AI_TOOL_BUILDER.pkb) against your own APEX workspace.
-2. Run [`test_tool_builder.sql`](test_tool_builder.sql) after filling in your own app ID, username, and AI Service static ID (the placeholders are marked with `<-- ...`).
+1. Compile [`AI_TOOL_BUILDER.pks`](src/AI_TOOL_BUILDER.pks) and [`AI_TOOL_BUILDER.pkb`](src/AI_TOOL_BUILDER.pkb) against your own APEX workspace.
+2. Run [`setup_demo_tools.sql`](tests/setup_demo_tools.sql), then [`test_single_tool.sql`](tests/test_single_tool.sql), [`test_multi_tool.sql`](tests/test_multi_tool.sql) and [`test_overloads.sql`](tests/test_overloads.sql). The first two need your own app ID, username, and AI Service static ID filled in (the placeholders are marked with `<-- ...`) for their agent-run block; `test_overloads.sql` and the first block of each of the other two need no LLM.
 3. In your PR description, say what you tested and paste the relevant output (e.g. `DBMS_OUTPUT` from the sanity-check block, or the agent's final response).
 
 ## Coding conventions for `@tool` / `@param` comments
@@ -20,7 +20,7 @@ If your change touches how the doc-comment block is written or parsed:
 
 ## Where to make common changes
 
-- **Add support for another parameter type** — edit `map_type` in [`AI_TOOL_BUILDER.pkb`](AI_TOOL_BUILDER.pkb).
+- **Add support for another parameter type** — edit `map_type` in [`AI_TOOL_BUILDER.pkb`](src/AI_TOOL_BUILDER.pkb) for the type the model sees. If the value needs special binding, also add a flag to `t_param_bind` (see `is_numeric` / `is_boolean`), set it in `build_tool`, and handle it in the bind loop of `generic_response_handler`.
 - **Change the comment convention** — edit `extract_doc_block` / `tag_value` in the same file.
 
 ## Pull requests
